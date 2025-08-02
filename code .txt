@@ -1,0 +1,549 @@
+# file: hybrid_tourism_recommender.py
+# A content-boosted hybrid recommender for travel cities
+# Works with: "Worldwide Travel Cities Dataset (Ratings and Climate).csv"
+
+import ast
+import json
+import warnings
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.utils.validation import check_is_fitted
+
+
+# ---------------------------
+# Utilities for parsing
+# ---------------------------
+
+def _safe_parse_list(cell) -> List[str]:
+    """
+    Parse a JSON-like list string into a list of strings safely.
+    Examples in the dataset: '["Short trip","Weekend","One week"]'
+    """
+    if pd.isna(cell):
+        return []
+    if isinstance(cell, list):
+        return [str(x) for x in cell]
+    s = str(cell).strip()
+    # Try ast.literal_eval (handles JSON-like python literals)
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, list):
+            return [str(x) for x in val]
+    except Exception:
+        pass
+    # Fallback: try json
+    try:
+        val = json.loads(s)
+        if isinstance(val, list):
+            return [str(x) for x in val]
+    except Exception:
+        pass
+    # Fallback: comma separated
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
+def _safe_parse_monthly_temps(cell) -> Dict[str, Dict[str, float]]:
+    """
+    Parse avg_temp_monthly field to a dict like:
+    {
+      "1": {"avg": 28.1, "max": 32.5, "min": 25.5},
+      ...
+      "12": {...}
+    }
+    Returns empty dict on failure.
+    """
+    if pd.isna(cell):
+        return {}
+    if isinstance(cell, dict):
+        return cell
+    s = str(cell).strip()
+    # Try ast then json
+    for parser in (ast.literal_eval, json.loads):
+        try:
+            val = parser(s)
+            if isinstance(val, dict):
+                return val
+        except Exception:
+            continue
+    return {}
+
+
+def _monthly_avg_vector(month_dict: Dict[str, Dict[str, float]]) -> List[float]:
+    """
+    Build a 12-dim vector of monthly average temperatures (Jan..Dec).
+    Missing months are imputed with the mean of available ones (or 0 if none).
+    """
+    avgs = []
+    for m in range(1, 13):
+        key = str(m)
+        if key in month_dict and isinstance(month_dict[key], dict):
+            avgs.append(float(month_dict[key].get("avg", np.nan)))
+        else:
+            avgs.append(np.nan)
+    if all(np.isnan(avgs)):
+        return [0.0] * 12
+    mean_val = float(np.nanmean(avgs))
+    return [float(x) if not np.isnan(x) else mean_val for x in avgs]
+
+
+# ---------------------------
+# Custom Transformers
+# ---------------------------
+
+class TextConcatenator(BaseEstimator, TransformerMixin):
+    """
+    Concatenate multiple text/categorical columns into a single string per row.
+    Optionally, include tokenized lists like ideal_durations.
+    """
+    def __init__(self, text_cols: List[str], list_cols: Optional[List[str]] = None):
+        self.text_cols = text_cols
+        self.list_cols = list_cols or []
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        texts = []
+        # IMPORTANT: TfidfVectorizer expects a 1D iterable of strings, not (n, 1)
+        for _, row in X.iterrows():
+            parts = []
+            for c in self.text_cols:
+                val = row.get(c, "")
+                parts.append("" if pd.isna(val) else str(val))
+            for lc in self.list_cols:
+                val = row.get(lc, [])
+                if not isinstance(val, list):
+                    val = _safe_parse_list(val)
+                parts.extend([str(x) for x in val])
+            # join all tokens for this row
+            texts.append(" ".join([p for p in parts if p]))
+        # Return a 1D list/array of strings
+        return np.asarray(texts, dtype=str)  # shape (n,)
+
+
+
+class MonthlyClimateExtractor(BaseEstimator, TransformerMixin):
+    """
+    Extract a 12-dim vector (Jan..Dec) of avg monthly temps from 'avg_temp_monthly'.
+    """
+    def __init__(self, source_col: str = "avg_temp_monthly"):
+        self.source_col = source_col
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        vectors = []
+        for _, row in X.iterrows():
+            mdict = _safe_parse_monthly_temps(row.get(self.source_col))
+            vec = _monthly_avg_vector(mdict)
+            vectors.append(vec)
+        return np.array(vectors, dtype=float)
+
+
+# ---------------------------
+# Recommender
+# ---------------------------
+
+@dataclass
+class HybridConfig:
+    text_weight: float = 1.0
+    numeric_weight: float = 1.0
+    climate_weight: float = 1.0
+    boost_region: float = 0.05       # additive boost if same region
+    boost_budget: float = 0.05       # additive boost if same budget
+    boost_duration: float = 0.05     # additive boost if city offers desired duration
+    topn_sim_pool: int = 1000        # pool size before applying boosts/filters
+    tfidf_max_features: int = 20000  # TF-IDF vocabulary cap
+
+
+class HybridTourismRecommender:
+    """
+    Content-boosted hybrid recommender for travel cities.
+
+    Features:
+    - TF-IDF on concatenated text: [city, country, region, short_description, budget_level, ideal_durations tokens]
+    - Scaled numeric features: culture, adventure, nature, beaches, nightlife, cuisine, wellness, urban, seclusion
+    - Scaled climate signature: 12 monthly average temperatures
+    - Final similarity = cosine(text_block, text_block) * w_t + cosine(numeric_block) * w_n + cosine(climate_block) * w_c
+    - Then apply additive boosts for region/budget/duration matches
+    """
+    def __init__(self, config: Optional[HybridConfig] = None):
+        self.config = config or HybridConfig()
+        self._fitted = False
+
+        self.numeric_cols = [
+            "culture", "adventure", "nature", "beaches", "nightlife",
+            "cuisine", "wellness", "urban", "seclusion"
+        ]
+        self.text_cols = ["city", "country", "region", "short_description", "budget_level"]
+        self.list_cols = ["ideal_durations"]  # token list source
+        self.id_col = "id"
+        self.name_col = "city"
+        self.region_col = "region"
+        self.budget_col = "budget_level"
+        self.duration_col = "ideal_durations"
+
+        # Pipelines
+        self.text_pipe = Pipeline(steps=[
+            ("concat", TextConcatenator(text_cols=self.text_cols, list_cols=self.list_cols)),
+            ("tfidf", TfidfVectorizer(stop_words="english",
+                                      max_features=self.config.tfidf_max_features,
+                                      ngram_range=(1, 2)))
+        ])
+
+        self.numeric_pipe = Pipeline(steps=[
+            ("select", FunctionTransformer(lambda df: df[self.numeric_cols], validate=False)),
+            ("scale", StandardScaler(with_mean=True, with_std=True))
+        ])
+
+        self.climate_pipe = Pipeline(steps=[
+            ("extract", MonthlyClimateExtractor(source_col="avg_temp_monthly")),
+            ("scale", StandardScaler(with_mean=True, with_std=True))
+        ])
+
+        # We'll store the matrices after fitting
+        self.text_matrix = None        # sparse
+        self.numeric_matrix = None     # dense
+        self.climate_matrix = None     # dense
+
+    def _validate_columns(self, df: pd.DataFrame):
+        required = set([self.id_col, self.name_col, self.region_col, self.budget_col,
+                        "short_description", "avg_temp_monthly", "ideal_durations"] + self.numeric_cols)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+
+    def _clean_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # Basic NA handling on key columns
+        for c in [self.name_col, "country", self.region_col, "short_description", self.budget_col]:
+            if c in df.columns:
+                df[c] = df[c].fillna("")
+
+        # Ensure numeric columns exist and are numeric
+        for c in self.numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+        # Ensure id exists; if not, create a stable one
+        if self.id_col not in df.columns:
+            df[self.id_col] = np.arange(len(df))
+
+        # Normalize budget_level casing
+        if self.budget_col in df.columns:
+            df[self.budget_col] = df[self.budget_col].astype(str).str.strip()
+
+        # Keep a parsed version of ideal_durations for boosting checks
+        df["_parsed_durations"] = df[self.duration_col].apply(_safe_parse_list)
+
+        return df
+
+    def fit(self, df: pd.DataFrame):
+        self._validate_columns(df)
+        self.items_df = self._clean_df(df)
+
+        # Text block (sparse)
+        self.text_matrix = self.text_pipe.fit_transform(self.items_df)
+
+        # Numeric block (dense)
+        self.numeric_matrix = self.numeric_pipe.fit_transform(self.items_df)
+
+        # Climate block (dense)
+        self.climate_matrix = self.climate_pipe.fit_transform(self.items_df)
+
+        self._fitted = True
+        return self
+
+    def _combined_similarity(self,
+                             idx_query: int,
+                             sim_pool: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Compute combined similarity for a given item index against all items (or a pool).
+        Final score = wt * cos(text) + wn * cos(numeric) + wc * cos(climate)
+        """
+        check_is_fitted(self, "_fitted")
+        if sim_pool is None:
+            sim_pool = np.arange(self.items_df.shape[0])
+
+        # Cosine on text (sparse x sparse)
+        tvec_q = self.text_matrix[idx_query]
+        tmat_pool = self.text_matrix[sim_pool]
+        sim_text = cosine_similarity(tvec_q, tmat_pool).ravel()
+
+        # Cosine on numeric (dense)
+        n_q = self.numeric_matrix[idx_query:idx_query+1, :]
+        n_pool = self.numeric_matrix[sim_pool, :]
+        sim_num = cosine_similarity(n_q, n_pool).ravel()
+
+        # Cosine on climate (dense)
+        c_q = self.climate_matrix[idx_query:idx_query+1, :]
+        c_pool = self.climate_matrix[sim_pool, :]
+        sim_cli = cosine_similarity(c_q, c_pool).ravel()
+
+        w = self.config
+        final = (w.text_weight * sim_text +
+                 w.numeric_weight * sim_num +
+                 w.climate_weight * sim_cli)
+        return final
+
+    def _apply_boosts(self,
+                      base_scores: np.ndarray,
+                      idx_query: int,
+                      pool_indices: np.ndarray,
+                      desired_region: Optional[str],
+                      desired_budget: Optional[str],
+                      desired_duration: Optional[str]) -> np.ndarray:
+        """
+        Apply additive boosts for matches in region/budget/duration.
+        """
+        boosted = base_scores.copy()
+
+        q_region = str(self.items_df.iloc[idx_query][self.region_col]).strip().lower()
+        q_budget = str(self.items_df.iloc[idx_query][self.budget_col]).strip().lower()
+
+        cfg = self.config
+        for i, idx in enumerate(pool_indices):
+            row = self.items_df.iloc[idx]
+            r = str(row[self.region_col]).strip().lower()
+            b = str(row[self.budget_col]).strip().lower()
+            durations = row["_parsed_durations"] or []
+
+            # If user provided desired_region, boost matching it;
+            # else boost items that share the query's region (content-based context).
+            if desired_region:
+                if r == str(desired_region).strip().lower():
+                    boosted[i] += cfg.boost_region
+            else:
+                if r == q_region and idx != idx_query:
+                    boosted[i] += cfg.boost_region
+
+            # Budget boost
+            if desired_budget:
+                if b == str(desired_budget).strip().lower():
+                    boosted[i] += cfg.boost_budget
+            else:
+                if b == q_budget and idx != idx_query:
+                    boosted[i] += cfg.boost_budget
+
+            # Duration boost
+            if desired_duration:
+                if any(str(desired_duration).strip().lower() == str(d).strip().lower() for d in durations):
+                    boosted[i] += cfg.boost_duration
+
+        return boosted
+
+    def recommend_similar_cities(self,
+                                 city_name: str,
+                                 topn: int = 10,
+                                 desired_region: Optional[str] = None,
+                                 desired_budget: Optional[str] = None,
+                                 desired_duration: Optional[str] = None,
+                                 filters: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+        """
+        Recommend cities similar to a given city, with optional context boosts and filters.
+
+        filters: e.g., {"region": "Europe", "budget_level": "Mid-range"}
+        """
+        check_is_fitted(self, "_fitted")
+        df = self.items_df
+
+        # Find query index
+        matches = df[df[self.name_col].str.strip().str.lower() == city_name.strip().lower()]
+        if matches.empty:
+            raise ValueError(f"City '{city_name}' not found.")
+        idx_query = matches.index[0]
+
+        # Optional filters to constrain candidate pool
+        pool_mask = np.ones(len(df), dtype=bool)
+        if filters:
+            for k, v in filters.items():
+                if k not in df.columns:
+                    warnings.warn(f"Ignoring unknown filter column '{k}'")
+                    continue
+                pool_mask &= (df[k].astype(str).str.strip().str.lower() == str(v).strip().lower())
+
+        pool_indices = np.where(pool_mask)[0]
+        # Exclude the query itself from final ranking, but keep it in similarity computation
+        # We'll drop it later.
+        base_scores = self._combined_similarity(idx_query, sim_pool=pool_indices)
+
+        # Apply content/context boosts
+        boosted = self._apply_boosts(
+            base_scores=base_scores,
+            idx_query=idx_query,
+            pool_indices=pool_indices,
+            desired_region=desired_region,
+            desired_budget=desired_budget,
+            desired_duration=desired_duration
+        )
+
+        # Build DataFrame
+        out = df.iloc[pool_indices][[self.id_col, self.name_col, "country", self.region_col, self.budget_col]].copy()
+        out["score"] = boosted
+        # Drop the query city itself
+        out = out[df.iloc[pool_indices][self.name_col].str.strip().str.lower() != city_name.strip().lower()]
+        out = out.sort_values("score", ascending=False).head(topn).reset_index(drop=True)
+        return out
+
+    def recommend_by_profile(self,
+                             category_preferences: Optional[Dict[str, float]] = None,
+                             desired_region: Optional[str] = None,
+                             desired_budget: Optional[str] = None,
+                             desired_duration: Optional[str] = None,
+                             topn: int = 10,
+                             filters: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+        """
+        Recommend cities from a user preference profile (no specific anchor city).
+        - category_preferences: weights for numeric features (e.g., {"culture": 1.0, "nightlife": 0.5, "nature": 1.5})
+          Missing features default to 0 (ignored).
+        - desired_region / desired_budget / desired_duration: apply boosts if matched.
+        - filters: restrict pool (e.g., {"region": "Asia"}).
+        """
+        check_is_fitted(self, "_fitted")
+        df = self.items_df
+
+        # Build a synthetic query vector for numeric + climate + text (lightweight)
+        # For text, we cannot build TF-IDF easily without text -> So we use an average text vector by default (neutral),
+        # and rely mostly on numeric/climate + boosts for this mode.
+        # As a workaround, we approximate the text similarity with zeros (neutral), focusing on numeric/climate.
+        # If you want keyword preferences, we can extend this to accept a keyword list and vectorize it.
+        n_features = self.numeric_matrix.shape[1]
+        c_features = self.climate_matrix.shape[1]
+
+        # Numeric query vector: weighted direction by user preferences
+        weights = np.zeros(len(self.numeric_cols), dtype=float)
+        if category_preferences:
+            for i, col in enumerate(self.numeric_cols):
+                weights[i] = float(category_preferences.get(col, 0.0))
+        # Normalize weights to unit length to behave like a direction in cosine space
+        if np.linalg.norm(weights) > 0:
+            weights = weights / np.linalg.norm(weights)
+
+        # Since numeric_matrix is StandardScaled, its mean is ~0.
+        # We'll use the weights directly as the synthetic query in scaled space.
+        n_q = weights.reshape(1, -1)
+        n_pool = self.numeric_matrix
+        sim_num = cosine_similarity(n_q, n_pool).ravel()
+
+        # Climate: neutral (zeros) unless you want to add a preferred temperature curve
+        c_q = np.zeros((1, c_features), dtype=float)
+        c_pool = self.climate_matrix
+        sim_cli = cosine_similarity(c_q, c_pool).ravel() * 0.0  # neutralized; can be extended later
+
+        # Text: neutralized (zeros). Can be extended to accept keyword preferences.
+        sim_text = np.zeros_like(sim_num)
+
+        w = self.config
+        base_scores = (w.text_weight * sim_text +
+                       w.numeric_weight * sim_num +
+                       w.climate_weight * sim_cli)
+
+        # Filters
+        pool_mask = np.ones(len(df), dtype=bool)
+        if filters:
+            for k, v in filters.items():
+                if k not in df.columns:
+                    warnings.warn(f"Ignoring unknown filter column '{k}'")
+                    continue
+                pool_mask &= (df[k].astype(str).str.strip().str.lower() == str(v).strip().lower())
+        pool_indices = np.where(pool_mask)[0]
+
+        # Apply boosts (no anchor city; use desired_* only)
+        boosted = base_scores.copy()
+        cfg = self.config
+        for i, idx in enumerate(range(len(df))):
+            if i not in pool_indices:
+                continue
+            row = df.iloc[idx]
+            r = str(row[self.region_col]).strip().lower()
+            b = str(row[self.budget_col]).strip().lower()
+            durations = row["_parsed_durations"] or []
+
+            if desired_region and r == str(desired_region).strip().lower():
+                boosted[idx] += cfg.boost_region
+            if desired_budget and b == str(desired_budget).strip().lower():
+                boosted[idx] += cfg.boost_budget
+            if desired_duration and any(str(desired_duration).strip().lower() == str(d).strip().lower() for d in durations):
+                boosted[idx] += cfg.boost_duration
+
+        out = df.loc[pool_indices, [self.id_col, self.name_col, "country", self.region_col, self.budget_col]].copy()
+        out["score"] = boosted[pool_indices]
+        out = out.sort_values("score", ascending=False).head(topn).reset_index(drop=True)
+        return out
+
+
+# ---------------------------
+# Example usage
+# ---------------------------
+
+def load_dataset(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    return df
+
+
+def main():
+    csv_path = r"C:\Users\PCD\Desktop\summer 2 semester\Recommendation system\Worldwide Travel Cities Dataset (Ratings and Climate).csv"
+    df = load_dataset(csv_path)
+
+    # Initialize and fit the recommender
+    config = HybridConfig(
+        text_weight=1.0,       # weight for TF-IDF similarity
+        numeric_weight=1.0,    # weight for numeric features similarity
+        climate_weight=1.0,    # weight for climate signature similarity
+        boost_region=0.05,
+        boost_budget=0.05,
+        boost_duration=0.05,
+        tfidf_max_features=20000,
+        topn_sim_pool=1000
+    )
+    rec = HybridTourismRecommender(config=config).fit(df)
+
+    # 1) Similar-to-city recommendations
+    # Pick a city that exists in the dataset; adjust as needed
+    anchor_city = df["city"].iloc[0]
+    print(anchor_city)
+    print(f"\nSimilar cities to: {anchor_city}\n")
+    sim_df = rec.recommend_similar_cities(
+        city_name=anchor_city,
+        topn=10,
+        desired_region=None,       # e.g., "Europe"
+        desired_budget=None,       # e.g., "Mid-range"
+        desired_duration=None,     # e.g., "Weekend"
+        filters=None               # e.g., {"region": "Europe"}
+    )
+    print(sim_df)
+
+    # 2) Recommendations from a user profile (feature weights)
+    # Example: user prefers culture and cuisine, somewhat nightlife; dislikes seclusion
+    user_prefs = {
+        "culture": 1.0,
+        "cuisine": 0.9,
+        "nightlife": 0.6,
+        "seclusion": -0.7  # negative preference will reduce cosine similarity directionally
+    }
+    # Note: negative weights are allowed; the normalization will keep direction.
+    print("\nProfile-based recommendations:\n")
+    prof_df = rec.recommend_by_profile(
+        category_preferences=user_prefs,
+        desired_region=None,         # or "Asia"
+        desired_budget=None,         # or "Budget" / "Mid-range" / "Luxury"
+        desired_duration=None,       # or "Weekend", "Short trip", "One week"
+        topn=10,
+        filters=None
+    )
+    print(prof_df)
+
+
+if __name__ == "__main__":
+    main()
